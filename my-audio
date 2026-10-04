@@ -1,0 +1,1456 @@
+#!/usr/bin/env python3
+"""my-audio -- set the macOS default audio output by rules, and show the audio status.
+
+A rule says "when this device is present, play through that one": an HDMI
+display is plugged in -> its own audio; a Bluetooth speaker connects -> a
+Multi-Output Device. `my-audio watch` (the LaunchAgent) applies the rules
+each time the set of audio devices changes, and never in between -- so an
+output chosen by hand stays until the next plug or unplug.
+
+Standard library only: CoreAudio is called through ctypes.
+"""
+from __future__ import annotations
+
+import ctypes
+import fnmatch
+import json
+import os
+import plistlib
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, NoReturn, Sequence, cast
+
+# __version__ names the release these bytes are BASED on -- only a release
+# commit sets it; v0.0: no release of my-audio exists yet.  SCRIPT_COMMIT is
+# the commit this file was released from and SCRIPT_RELEASE what `git describe
+# --tags --long` said then; both are written by `my-audio --stamp-version`, so
+# a copy without a .git beside it can still say what it is.
+__version__ = "v0.0"
+SCRIPT_COMMIT = "ab82cac"
+SCRIPT_RELEASE = ""
+__copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
+__license__ = "All rights reversed."
+
+NAME = "my-audio"
+VERBS = ("apply", "watch", "install", "uninstall")
+# CoreAudio's transport types (kAudioDeviceTransportType*), spaces stripped
+TRANSPORTS = ("bltn", "usb", "hdmi", "dprt", "blue", "blea", "airp", "grup", "virt",
+              "thun", "pci", "1394", "eavb", "ccwd", "fwrk", "unkn")
+CONFIG_KEYS = ("AUDIO_RULES", "OUTPUT_FALLBACK", "RECHECK_INTERVAL", "SETTLE_TIME",
+               "LAUNCHD_LABEL", "LOG_FILE")
+
+# What the run is doing right now -- said when it is interrupted (Ctrl-C).
+PHASE = ["starting"]
+# Where an unexpected error's trace goes: the log's directory once the config
+# is read, else the per-user log directory, else the system temp directory.
+TRACE_DIR = [""]
+
+
+def err(code: str, msg: str = "Please fix.", exit_code: int = 1) -> NoReturn:
+    """Print `ERROR <code> [<exit>]: <msg>` to stderr and exit."""
+    sys.stderr.write(f"ERROR {code} [{exit_code}]: {msg}\n")
+    sys.stderr.flush()
+    sys.exit(exit_code)
+
+
+def error_line(code: str, msg: str) -> None:
+    """The same ERROR line, for a loop that must go on after it (watch)."""
+    sys.stderr.write(f"ERROR {code}: {msg}\n")
+    sys.stderr.flush()
+
+
+USAGE = f"""\
+usage: {NAME} [-Q] [-V] [-D [PATH]] [--config FILE] [<VERB>]
+       {NAME} [-h] [--version] [--create-config [FILE]] [--run-tests [FILTER]]
+              [--stamp-version]
+
+Sets the macOS default audio output by rules -- "when this device is present,
+play through that one" -- each time the set of audio devices changes, and
+never in between: an output chosen by hand stays until the next plug or
+unplug. The rules are AUDIO_RULES in the config (--create-config explains
+them).
+
+  (no verb)             the status: the current output and the rule that
+                        picked it, volume and mute, the agent's state
+  apply                 apply the rules now, once, and switch if they say so
+  watch                 the loop the LaunchAgent runs: CoreAudio wakes it when
+                        a device comes or goes, and it re-checks every
+                        RECHECK_INTERVAL seconds besides
+  install               write the LaunchAgent (LAUNCHD_LABEL) for this user's
+                        GUI session and load it; it runs `watch`, logging to
+                        LOG_FILE, with the Python that ran `install`
+  uninstall             what removing the LaunchAgent would do; `uninstall go`
+                        unloads it and removes its plist
+
+  -Q                    no standard output; errors still go to stderr
+  -V                    add the detail: every device with its transport, uid
+                        and output streams, every command as it runs
+  -D [PATH]             -V and the diagnostics (" ~~~ "), appended to PATH too
+  --config FILE         use FILE; else $MY_AUDIO_CONFIG, else the first of
+                        /LINKS/default/{NAME}.conf, /LINKS/default/{NAME},
+                        ~/.{NAME}.conf, /etc/{NAME}.conf,
+                        /usr/local/etc/{NAME}.conf
+  --create-config [FILE]
+                        the default config, to stdout or to a new FILE (an
+                        existing one is never overwritten)
+  -h, --help            this text
+  --version             version, git's describe and the build id (a hash of
+                        this file)
+  --run-tests [FILTER]  the self-test; FILTER is a substring of a test title
+  --stamp-version       record HEAD in this file and amend that commit --
+                        after committing, before pushing
+"""
+
+
+def default_config() -> str:
+    """The default config -- the only place a default value lives."""
+    return f"""\
+# {NAME} -- configuration (shell syntax, read with '.')
+# Found at: $MY_AUDIO_CONFIG, --config FILE, else the first of
+# /LINKS/default/{NAME}.conf, /LINKS/default/{NAME}, ~/.{NAME}.conf,
+# /etc/{NAME}.conf, /usr/local/etc/{NAME}.conf.
+
+# AUDIO_RULES -- one rule per line, read top to bottom. Each time the set of
+# audio devices changes, the FIRST rule whose device is present picks the
+# output:
+#     <transport>:<device-name glob> => <target device name | @>
+# '@' is the matched device itself (only devices with outputs count for it).
+# Transports, as CoreAudio names them: bltn (built-in) usb hdmi dprt
+# (DisplayPort) blue (Bluetooth) blea (Bluetooth LE) airp (AirPlay) grup
+# (aggregate / Multi-Output) virt thun (Thunderbolt) pci 1394 eavb ccwd fwrk
+# unkn -- or * for any. `{NAME} -V` lists the present devices with theirs.
+# Names are the ones Audio MIDI Setup shows; a name holding ' cannot be
+# written inside these quotes.
+AUDIO_RULES='
+hdmi:*  => @                     # an HDMI display or receiver: play through it
+dprt:*  => @                     # a DisplayPort display: play through it
+blue:*  => Multi-Output Device   # any Bluetooth audio device
+'
+
+# No rule matches: the output to use; "" leaves the output as it is.
+OUTPUT_FALLBACK=""
+
+# CoreAudio wakes `watch` as soon as a device comes or goes; besides, it
+# re-reads the device list every RECHECK_INTERVAL seconds.
+RECHECK_INTERVAL=60
+
+# After a wake-up, seconds to let the device list settle (a device often
+# arrives in several steps) before the rules are applied.
+SETTLE_TIME=1
+
+# The LaunchAgent's label, for `{NAME} install` (e.g. com.example.{NAME}_watch).
+LAUNCHD_LABEL="local.{NAME}"
+
+# Where the LaunchAgent's output goes. The default keeps one directory per
+# user under /var/log/mine; outside such a setup, ~/Library/Logs/{NAME}.log
+# is the usual place.
+LOG_FILE="/var/log/mine/$(id -un)/{NAME}.log"
+"""
+
+
+# --------------------------------------------------------------------------
+# Output
+
+
+@dataclass
+class Out:
+    """Every line the tool prints goes through here: -Q silences the standard
+    output, -V adds detail, -D diagnostics. Errors never pass through."""
+    quiet: bool = False
+    verbose: bool = False
+    debug: bool = False
+    debug_path: str = ""
+
+    def msg(self, line: str) -> None:
+        if not self.quiet:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    def det(self, line: str) -> None:
+        if self.verbose:
+            self.msg(line)
+
+    def dbg(self, line: str) -> None:
+        if not self.debug:
+            return
+        self.msg(f" ~~~ {line}")
+        if self.debug_path:
+            try:
+                with open(self.debug_path, "a") as f:
+                    f.write(f"{now()} ~~~ {line}\n")
+            except OSError as e:
+                err("00001", f"cannot append to the -D file '{self.debug_path}': {e.strerror}")
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# --------------------------------------------------------------------------
+# Audio devices
+
+
+@dataclass(frozen=True)
+class Device:
+    id: int
+    uid: str
+    name: str
+    transport: str
+    outputs: int     # output streams; a Multi-Output Device can report 0
+
+
+class AudioError(Exception):
+    """CoreAudio refused something; the message says what."""
+
+
+class Audio:
+    """What my-audio needs from the system's audio. CoreAudio is the real one;
+    the self-test drives a fake one through the same interface."""
+
+    def devices(self) -> list[Device]:
+        raise NotImplementedError
+
+    def default_output(self) -> int | None:
+        raise NotImplementedError
+
+    def set_default_output(self, dev: Device) -> None:
+        raise NotImplementedError
+
+    def volume(self, dev_id: int) -> float | None:
+        raise NotImplementedError
+
+    def muted(self, dev_id: int) -> bool | None:
+        raise NotImplementedError
+
+    def listen(self, wake: Callable[[], None]) -> bool:
+        """Call `wake` whenever the device list changes; False if refused."""
+        raise NotImplementedError
+
+
+class _Addr(ctypes.Structure):
+    _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
+
+
+def _fcc(s: str) -> int:
+    return int.from_bytes(s.encode("ascii"), "big")
+
+
+def _unfcc(v: int) -> str:
+    return v.to_bytes(4, "big").decode("latin-1").strip() or "?"
+
+
+_SYSTEM = 1                      # kAudioObjectSystemObject
+_GLOB = _fcc("glob")             # kAudioObjectPropertyScopeGlobal
+_OUTP = _fcc("outp")             # kAudioObjectPropertyScopeOutput
+_UTF8 = 0x08000100               # kCFStringEncodingUTF8
+_FRAMEWORKS = "/System/Library/Frameworks"
+_LISTENER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p)
+
+
+class CoreAudio(Audio):
+    """The real thing: CoreAudio's AudioObject calls, through ctypes."""
+
+    def __init__(self) -> None:
+        self.ca = ctypes.CDLL(f"{_FRAMEWORKS}/CoreAudio.framework/CoreAudio")
+        self.cf = ctypes.CDLL(f"{_FRAMEWORKS}/CoreFoundation.framework/CoreFoundation")
+        self.tb = ctypes.CDLL(f"{_FRAMEWORKS}/AudioToolbox.framework/AudioToolbox")
+        addr = ctypes.POINTER(_Addr)
+        u32p = ctypes.POINTER(ctypes.c_uint32)
+        self.ca.AudioObjectGetPropertyDataSize.argtypes = [ctypes.c_uint32, addr, ctypes.c_uint32, ctypes.c_void_p, u32p]
+        self.ca.AudioObjectGetPropertyData.argtypes = [ctypes.c_uint32, addr, ctypes.c_uint32, ctypes.c_void_p, u32p, ctypes.c_void_p]
+        self.ca.AudioObjectSetPropertyData.argtypes = [ctypes.c_uint32, addr, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        self.ca.AudioObjectAddPropertyListener.argtypes = [ctypes.c_uint32, addr, _LISTENER, ctypes.c_void_p]
+        self.tb.AudioHardwareServiceGetPropertyData.argtypes = [ctypes.c_uint32, addr, ctypes.c_uint32, ctypes.c_void_p, u32p, ctypes.c_void_p]
+        for f in (self.ca.AudioObjectGetPropertyDataSize, self.ca.AudioObjectGetPropertyData,
+                  self.ca.AudioObjectSetPropertyData, self.ca.AudioObjectAddPropertyListener,
+                  self.tb.AudioHardwareServiceGetPropertyData):
+            f.restype = ctypes.c_int32
+        self.cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        self.cf.CFStringGetCString.restype = ctypes.c_bool
+        self.cf.CFRelease.argtypes = [ctypes.c_void_p]
+        self._keep: list[object] = []      # the listener callback must outlive the call
+
+    def _size(self, obj: int, sel: str, scope: int = _GLOB) -> int | None:
+        a = _Addr(_fcc(sel), scope, 0)
+        n = ctypes.c_uint32(0)
+        rc = int(self.ca.AudioObjectGetPropertyDataSize(obj, ctypes.byref(a), 0, None, ctypes.byref(n)))
+        return n.value if rc == 0 else None
+
+    def _u32(self, obj: int, sel: str, scope: int = _GLOB) -> int | None:
+        a = _Addr(_fcc(sel), scope, 0)
+        v = ctypes.c_uint32(0)
+        n = ctypes.c_uint32(ctypes.sizeof(v))
+        rc = int(self.ca.AudioObjectGetPropertyData(obj, ctypes.byref(a), 0, None, ctypes.byref(n), ctypes.byref(v)))
+        return v.value if rc == 0 else None
+
+    def _str(self, obj: int, sel: str) -> str:
+        a = _Addr(_fcc(sel), _GLOB, 0)
+        ref = ctypes.c_void_p(None)
+        n = ctypes.c_uint32(ctypes.sizeof(ref))
+        rc = int(self.ca.AudioObjectGetPropertyData(obj, ctypes.byref(a), 0, None, ctypes.byref(n), ctypes.byref(ref)))
+        if rc != 0 or not ref.value:
+            return ""
+        buf = ctypes.create_string_buffer(1024)
+        ok = bool(self.cf.CFStringGetCString(ref.value, buf, len(buf), _UTF8))
+        self.cf.CFRelease(ref.value)
+        return buf.value.decode("utf-8", "replace") if ok else ""
+
+    def devices(self) -> list[Device]:
+        size = self._size(_SYSTEM, "dev#")
+        if size is None:
+            raise AudioError("CoreAudio does not list its devices")
+        ids = (ctypes.c_uint32 * (size // 4))()
+        a = _Addr(_fcc("dev#"), _GLOB, 0)
+        n = ctypes.c_uint32(size)
+        rc = int(self.ca.AudioObjectGetPropertyData(_SYSTEM, ctypes.byref(a), 0, None, ctypes.byref(n), ids))
+        if rc != 0:
+            raise AudioError(f"CoreAudio does not list its devices [OSStatus {rc}]")
+        out: list[Device] = []
+        for i in list(ids)[: n.value // 4]:
+            tran = self._u32(i, "tran")
+            out.append(Device(id=int(i), uid=self._str(i, "uid "), name=self._str(i, "lnam"),
+                              transport=_unfcc(tran) if tran is not None else "?",
+                              outputs=(self._size(i, "stm#", _OUTP) or 0) // 4))
+        return out
+
+    def default_output(self) -> int | None:
+        return self._u32(_SYSTEM, "dOut")
+
+    def set_default_output(self, dev: Device) -> None:
+        a = _Addr(_fcc("dOut"), _GLOB, 0)
+        v = ctypes.c_uint32(dev.id)
+        rc = int(self.ca.AudioObjectSetPropertyData(_SYSTEM, ctypes.byref(a), 0, None, ctypes.sizeof(v), ctypes.byref(v)))
+        if rc != 0:
+            raise AudioError(f"CoreAudio refused '{dev.name}' as the default output [OSStatus {rc}]")
+
+    def volume(self, dev_id: int) -> float | None:
+        # the main volume as the menu bar shows it (VirtualMainVolume)
+        a = _Addr(_fcc("vmvc"), _OUTP, 0)
+        v = ctypes.c_float(0.0)
+        n = ctypes.c_uint32(ctypes.sizeof(v))
+        rc = int(self.tb.AudioHardwareServiceGetPropertyData(dev_id, ctypes.byref(a), 0, None, ctypes.byref(n), ctypes.byref(v)))
+        return float(v.value) if rc == 0 else None
+
+    def muted(self, dev_id: int) -> bool | None:
+        m = self._u32(dev_id, "mute", _OUTP)
+        return None if m is None else m != 0
+
+    def listen(self, wake: Callable[[], None]) -> bool:
+        # NULL as the HAL's run loop: notifications arrive on CoreAudio's own
+        # thread, so no run loop is needed here
+        a = _Addr(_fcc("rnlp"), _GLOB, 0)
+        null = ctypes.c_void_p(None)
+        self.ca.AudioObjectSetPropertyData(_SYSTEM, ctypes.byref(a), 0, None, ctypes.sizeof(null), ctypes.byref(null))
+
+        def cb(_obj: int, _n: int, _addrs: int | None, _data: int | None) -> int:
+            wake()
+            return 0
+        proc = _LISTENER(cb)
+        self._keep.append(proc)
+        b = _Addr(_fcc("dev#"), _GLOB, 0)
+        return int(self.ca.AudioObjectAddPropertyListener(_SYSTEM, ctypes.byref(b), proc, None)) == 0
+
+
+def device_from_json(d: dict[str, object]) -> Device:
+    """One device of the fake audio's JSON; a missing field raises KeyError."""
+    i, outputs = d["id"], d["outputs"]
+    if not isinstance(i, int) or not isinstance(outputs, int):
+        raise AudioError(f"device {d!r}: id and outputs must be numbers")
+    return Device(id=i, uid=str(d["uid"]), name=str(d["name"]), transport=str(d["tran"]), outputs=outputs)
+
+
+class FakeAudio(Audio):
+    """The self-test's audio: a JSON file, re-read on every call, so a test
+    can plug and unplug between two calls. Selected by $MY_AUDIO_FAKE."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def _load(self) -> dict[str, object]:
+        with open(self.path) as f:
+            data: dict[str, object] = json.load(f)
+        return data
+
+    def _raw(self) -> list[dict[str, object]]:
+        raw = self._load().get("devices")
+        if not isinstance(raw, list):
+            raise AudioError(f"{self.path}: no device list")
+        return cast("list[dict[str, object]]", raw)
+
+    def devices(self) -> list[Device]:
+        return [device_from_json(d) for d in self._raw()]
+
+    def default_output(self) -> int | None:
+        v = self._load().get("default")
+        return v if isinstance(v, int) else None
+
+    def set_default_output(self, dev: Device) -> None:
+        data = self._load()
+        data["default"] = dev.id
+        sets = data.get("sets", 0)
+        data["sets"] = (sets if isinstance(sets, int) else 0) + 1
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, self.path)
+
+    def _field(self, dev_id: int, key: str) -> object:
+        return next((d.get(key) for d in self._raw() if d.get("id") == dev_id), None)
+
+    def volume(self, dev_id: int) -> float | None:
+        v = self._field(dev_id, "volume")
+        return float(v) if isinstance(v, (int, float)) else None
+
+    def muted(self, dev_id: int) -> bool | None:
+        v = self._field(dev_id, "mute")
+        return v if isinstance(v, bool) else None
+
+    def listen(self, wake: Callable[[], None]) -> bool:
+        return False
+
+
+def audio() -> Audio:
+    fake = os.environ.get("MY_AUDIO_FAKE", "")
+    return FakeAudio(fake) if fake else CoreAudio()
+
+
+# --------------------------------------------------------------------------
+# Rules
+
+
+@dataclass(frozen=True)
+class Rule:
+    index: int        # 1-based, in AUDIO_RULES order
+    text: str         # the rule as written, comment stripped
+    transport: str
+    glob: str
+    target: str       # a device name, or "@" for the matched device
+
+    def matches(self, d: Device) -> bool:
+        if self.transport != "*" and d.transport != self.transport:
+            return False
+        if not fnmatch.fnmatchcase(d.name, self.glob):
+            return False
+        return self.target != "@" or d.outputs > 0   # '@' must be playable
+
+
+def parse_rules(text: str) -> list[Rule]:
+    """AUDIO_RULES -> rules; ValueError names the line that is wrong."""
+    rules: list[Rule] = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw
+        for i, ch in enumerate(raw):    # a comment starts at '#' after a blank, or first
+            if ch == "#" and (i == 0 or raw[i - 1] in " \t"):
+                line = raw[:i]
+                break
+        line = line.strip()
+        if not line:
+            continue
+        left, sep, target = line.partition("=>")
+        if not sep:
+            raise ValueError(f"line {n} of AUDIO_RULES has no '=>': '{line}'")
+        transport, sep2, glob = left.strip().partition(":")
+        transport, glob, target = transport.strip().lower(), glob.strip(), target.strip()
+        if not sep2 or not glob:
+            raise ValueError(f"line {n} of AUDIO_RULES: '{left.strip()}' is not <transport>:<device-name glob>")
+        if transport != "*" and transport not in TRANSPORTS:
+            raise ValueError(f"line {n} of AUDIO_RULES: unknown transport '{transport}' "
+                             f"(known: {' '.join(TRANSPORTS)}, or *)")
+        if not target:
+            raise ValueError(f"line {n} of AUDIO_RULES has no target after '=>'")
+        rules.append(Rule(index=len(rules) + 1, text=" ".join(line.split()),
+                          transport=transport, glob=glob, target=target))
+    return rules
+
+
+@dataclass(frozen=True)
+class Decision:
+    target: str | None          # the output the rules want; None = leave it
+    rule: Rule | None           # the rule that decided; None = the fallback
+    matched: Device | None      # the device that made the rule match
+
+    def why(self) -> str:
+        if self.rule is None:
+            return "no rule matches: " + ("OUTPUT_FALLBACK" if self.target else "left as is")
+        m = f" -- '{self.matched.name}' present" if self.matched else ""
+        return f"rule {self.rule.index}: {self.rule.text}{m}"
+
+
+def decide(rules: Sequence[Rule], fallback: str, devices: Sequence[Device]) -> Decision:
+    """The first rule with a present device wins; else the fallback."""
+    for r in rules:
+        for d in devices:
+            if r.matches(d):
+                return Decision(target=d.name if r.target == "@" else r.target, rule=r, matched=d)
+    return Decision(target=fallback or None, rule=None, matched=None)
+
+
+# --------------------------------------------------------------------------
+# Config
+
+
+@dataclass(frozen=True)
+class Config:
+    path: str
+    explicit: bool        # from --config / $MY_AUDIO_CONFIG: the agent must be told
+    rules: list[Rule]
+    fallback: str
+    recheck: float
+    settle: float
+    label: str
+    log_file: str
+
+
+def links_root() -> str:
+    return os.environ.get("LINKS") or "/LINKS"
+
+
+def config_search_paths() -> list[str]:
+    """Where the config is looked for, in order -- the one list the search
+    and the offer both use."""
+    d = f"{links_root()}/default"
+    return [f"{d}/{NAME}.conf", f"{d}/{NAME}", os.path.expanduser(f"~/.{NAME}.conf"),
+            f"/etc/{NAME}.conf", f"/usr/local/etc/{NAME}.conf"]
+
+
+def config_offer() -> list[str]:
+    """Paste-ready lines to create a config, most common place first; each
+    one checked to be READ by the search, so the offer cannot drift."""
+    search = config_search_paths()
+    site = f"{links_root()}/global/etc/default"
+    cand: list[tuple[str, str, str]] = []     # (write here, read there, note)
+    if os.path.isdir(site):
+        cand.append((f"{site}/{NAME}.conf", f"{links_root()}/default/{NAME}.conf",
+                     "as root; then `my-rollout go` links it"))
+    cand.append((f"/etc/{NAME}.conf", f"/etc/{NAME}.conf", "as root"))
+    home = os.path.expanduser(f"~/.{NAME}.conf")
+    cand.append((home, home, ""))
+    return [f"        > {NAME} --create-config > {w}" + (f"   ({note})" if note else "")
+            for w, r, note in cand if r in search]
+
+
+def find_config(explicit: str) -> tuple[str, bool]:
+    if explicit:
+        return explicit, True
+    env = os.environ.get("MY_AUDIO_CONFIG", "")
+    if env:
+        return env, True
+    for p in config_search_paths():
+        if os.path.isfile(p):
+            return p, False
+    sys.stderr.write(f"!!! {NAME} needs a config: the rules are yours to write.\n"
+                     f"--> no config found -- write one, most common place first "
+                     f"(`{NAME} -h` has the search order):\n" + "\n".join(config_offer()) + "\n")
+    err("00002", "no config found", 2)
+
+
+def load_config(path: str, explicit: bool) -> Config:
+    """Source the config with a POSIX shell and read the keys back."""
+    if not os.path.isfile(path):
+        err("00003", f"config '{path}' does not exist")
+    if not os.access(path, os.R_OK):
+        err("00004", f"config '{path}' is not readable")
+    sh = "/bin/dash" if os.path.exists("/bin/dash") else "/bin/sh"
+    script = ('. "$1" >/dev/null || exit 3; shift; '
+              'for k; do eval "s=\\${$k+1} v=\\${$k-}"; printf "%s\\0%s\\0" "${s:-0}" "$v"; done')
+    p = subprocess.run([sh, "-c", script, NAME, path, *CONFIG_KEYS], capture_output=True, text=True)
+    if p.returncode != 0:
+        err("00005", f"config '{path}' does not source cleanly [rc {p.returncode}]: "
+                     f"{p.stderr.strip() or 'no message'}")
+    parts = p.stdout.split("\0")
+    vals: dict[str, str] = {}
+    for i, k in enumerate(CONFIG_KEYS):
+        if parts[2 * i] != "1":
+            err("00006", f"config '{path}' does not set {k} -- `{NAME} --create-config` shows it")
+        vals[k] = parts[2 * i + 1]
+    try:
+        rules = parse_rules(vals["AUDIO_RULES"])
+    except ValueError as e:
+        err("00007", f"config '{path}': {e}")
+    try:
+        recheck = float(vals["RECHECK_INTERVAL"])
+        settle = float(vals["SETTLE_TIME"])
+    except ValueError:
+        err("00008", f"config '{path}': RECHECK_INTERVAL and SETTLE_TIME are seconds, got "
+                     f"'{vals['RECHECK_INTERVAL']}' and '{vals['SETTLE_TIME']}'")
+    if recheck <= 0 or settle < 0:
+        err("00009", f"config '{path}': RECHECK_INTERVAL must be > 0 and SETTLE_TIME >= 0 "
+                     f"[{recheck}, {settle}]")
+    label = vals["LAUNCHD_LABEL"]
+    if not label or "/" in label or " " in label:
+        err("00010", f"config '{path}': LAUNCHD_LABEL must be one word without '/', got '{label}'")
+    if not vals["LOG_FILE"].startswith("/"):
+        err("00011", f"config '{path}': LOG_FILE must be an absolute path, got '{vals['LOG_FILE']}'")
+    TRACE_DIR[0] = os.path.dirname(vals["LOG_FILE"])
+    return Config(path=path, explicit=explicit, rules=rules, fallback=vals["OUTPUT_FALLBACK"],
+                  recheck=recheck, settle=settle, label=label, log_file=vals["LOG_FILE"])
+
+
+def create_config(target: str) -> int:
+    if not target:
+        sys.stdout.write(default_config())
+        return 0
+    try:
+        with open(target, "x") as f:
+            f.write(default_config())
+    except FileExistsError:
+        err("00012", f"'{target}' exists -- never overwritten; compare with "
+                     f"`{NAME} --create-config | diff - {target}`")
+    except OSError as e:
+        err("00013", f"cannot write '{target}': {e.strerror}")
+    sys.stdout.write(f" >>> wrote the default config to {target}\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Doing it
+
+
+def by_id(devices: Sequence[Device], dev_id: int | None) -> Device | None:
+    return next((d for d in devices if d.id == dev_id), None)
+
+
+def apply_rules(a: Audio, cfg: Config, out: Out, devices: Sequence[Device], stamp: str = "") -> bool:
+    """Switch the default output to what the rules want. False when that
+    cannot be done -- reported, never raised: `watch` goes on after it."""
+    dec = decide(cfg.rules, cfg.fallback, devices)
+    cur = by_id(devices, a.default_output())
+    cur_name = cur.name if cur else "?"
+    out.dbg(f"decided: target={dec.target!r} by {dec.why()}; current={cur_name!r}")
+    if dec.target is None:
+        out.msg(f" >>> {stamp}output: {cur_name}  ({dec.why()})")
+        return True
+    # a target is found by NAME only: a Multi-Output Device can report 0
+    # output streams and is still the right target
+    want = next((d for d in devices if d.name == dec.target), None)
+    if want is None:
+        error_line("00014", f"target '{dec.target}' is not a present device ({dec.why()}) -- "
+                            f"`{NAME} -V` lists them")
+        return False
+    if cur is not None and cur.id == want.id:
+        out.msg(f" >>> {stamp}output: {want.name}  (unchanged; {dec.why()})")
+        return True
+    try:
+        a.set_default_output(want)
+    except AudioError as e:
+        error_line("00015", str(e))
+        return False
+    out.msg(f" >>> {stamp}output -> {want.name}  (was {cur_name}; {dec.why()})")
+    return True
+
+
+def watch_step(a: Audio, cfg: Config, out: Out, prev: frozenset[str] | None) -> frozenset[str]:
+    """One look at the devices: apply the rules only when the set of present
+    devices differs from `prev` (None: the first look). Returns the new set."""
+    devices = a.devices()
+    cur = frozenset(d.uid for d in devices)
+    if cur == prev:
+        out.dbg(f"device set unchanged ({len(cur)} devices): nothing to do")
+        return cur
+    stamp = f"{now()} "
+    if prev is None:
+        out.msg(f" >>> {stamp}start: {len(devices)} devices")
+    else:
+        names = {d.uid: d.name for d in devices}
+        gone = sorted(prev - cur)
+        came = sorted(cur - prev)
+        out.msg(f" >>> {stamp}devices changed: "
+                + " ".join([f"+{names.get(u, u)}" for u in came] + [f"-{u}" for u in gone]))
+    apply_rules(a, cfg, out, devices, stamp)
+    return cur
+
+
+class _Stop(Exception):
+    """SIGTERM: launchd unloads the agent."""
+
+
+def _on_term(_sig: int, _frame: object) -> None:
+    raise _Stop()
+
+
+def watch(a: Audio, cfg: Config, out: Out) -> int:
+    signal.signal(signal.SIGTERM, _on_term)
+    wake = threading.Event()
+    pushed = a.listen(wake.set)
+    out.msg(f" >>> {now()} watching ({'CoreAudio wakes it; ' if pushed else 'no CoreAudio listener: '}"
+            f"re-check every {cfg.recheck:g} s) -- config {cfg.path}")
+    prev: frozenset[str] | None = None
+    PHASE[0] = "watching the devices"
+    try:
+        while True:
+            prev = watch_step(a, cfg, out, prev)
+            if wake.wait(cfg.recheck):
+                out.dbg(f"woken by CoreAudio; settling {cfg.settle:g} s")
+                time.sleep(cfg.settle)
+            wake.clear()
+    except _Stop:
+        out.msg(f" >>> {now()} stopped (SIGTERM)")
+        return 0
+
+
+def volume_text(a: Audio, dev: Device) -> str:
+    v = a.volume(dev.id)
+    m = a.muted(dev.id)
+    vol = f"volume {round(v * 100)}%" if v is not None else "volume n/a (the device has no main volume)"
+    return vol + ("" if m is None else (", muted" if m else ", not muted"))
+
+
+def launchctl() -> str:
+    # the self-test points this at a stub, so no test touches the real launchd
+    return os.environ.get("MY_AUDIO_LAUNCHCTL", "") or "/bin/launchctl"
+
+
+def agent_state(label: str) -> tuple[bool, str]:
+    """(loaded, what to say about it) from `launchctl print`."""
+    p = subprocess.run([launchctl(), "print", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True)
+    if p.returncode != 0:
+        return False, f"not loaded ({label}; `{NAME} install`)"
+    info: dict[str, str] = {}
+    for ln in p.stdout.splitlines():
+        k, sep, v = ln.strip().partition(" = ")
+        if sep and k in ("state", "pid", "last exit code") and k not in info:
+            info[k] = v.strip()
+    if info.get("state") == "running":
+        return True, f"running [pid {info.get('pid', '?')}] ({label})"
+    return True, (f"loaded, {info.get('state', 'not running')} "
+                  f"[last exit {info.get('last exit code', '?')}] ({label})")
+
+
+def status(a: Audio, cfg: Config, out: Out) -> int:
+    devices = a.devices()
+    cur = by_id(devices, a.default_output())
+    dec = decide(cfg.rules, cfg.fallback, devices)
+    if cur is None:
+        out.msg(" >>> output: none  (CoreAudio has no default output)")
+    else:
+        if dec.target is None:
+            why = dec.why()
+        elif dec.target == cur.name:
+            why = dec.why()
+        elif not any(d.name == dec.target for d in devices):
+            why = f"the rules want '{dec.target}', which is not present -- {dec.why()}"
+        else:
+            why = (f"chosen by hand since the last change, or the agent is not running; "
+                   f"the rules want '{dec.target}' -- {dec.why()}")
+        out.msg(f" >>> output: {cur.name}  ({why})")
+        out.msg(f"    > {volume_text(a, cur)}")
+    out.msg(f"    > agent: {agent_state(cfg.label)[1]}")
+    out.det(f"    > devices ({len(devices)}; * = the output; config {cfg.path}):")
+    for d in devices:
+        mark = "*" if cur is not None and d.id == cur.id else " "
+        out.det(f"   > {mark} {d.name}  [{d.transport}, {d.outputs} out, uid {d.uid}]")
+    return 0
+
+
+def run(out: Out, *cmd: str) -> subprocess.CompletedProcess[str]:
+    """Run a command; under -V it is echoed first, from the same argv."""
+    out.det(" >>> " + " ".join(cmd))
+    return subprocess.run(list(cmd), capture_output=True, text=True)
+
+
+def plist_path(label: str) -> str:
+    return os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+
+
+def install(cfg: Config, out: Out) -> int:
+    PHASE[0] = "installing the LaunchAgent"
+    log_dir = os.path.dirname(cfg.log_file)
+    if not os.path.isdir(log_dir) or not os.access(log_dir, os.W_OK):
+        err("00016", f"the log directory '{log_dir}' (LOG_FILE) is missing or not writable for "
+                     f"{os.environ.get('USER', os.getuid())} -- create it, or set LOG_FILE")
+    tool = os.path.abspath(sys.argv[0])
+    args = [sys.executable, tool, "watch"] + (["--config", os.path.abspath(cfg.path)] if cfg.explicit else [])
+    data = plistlib.dumps({
+        "Label": cfg.label,
+        "ProgramArguments": args,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "LimitLoadToSessionType": "Aqua",
+        "StandardOutPath": cfg.log_file,
+        "StandardErrorPath": cfg.log_file,
+        "ProcessType": "Background",
+    })
+    path = plist_path(cfg.label)
+    try:
+        with open(path, "rb") as f:
+            old = f.read()
+    except OSError:
+        old = b""
+    loaded, state = agent_state(cfg.label)
+    if old == data and loaded:
+        out.msg(f" >>> already installed: {state}")
+        out.det(f"    > plist {path} is the one `install` writes now")
+        return 0
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    target = f"gui/{os.getuid()}"
+    if loaded:
+        p = run(out, launchctl(), "bootout", f"{target}/{cfg.label}")
+        if p.returncode != 0:
+            err("00017", f"launchctl bootout {target}/{cfg.label} failed [rc {p.returncode}]: {p.stderr.strip()}")
+    p = run(out, launchctl(), "bootstrap", target, path)
+    if p.returncode != 0:
+        err("00018", f"launchctl bootstrap {target} {path} failed [rc {p.returncode}]: {p.stderr.strip()}")
+    out.msg(f" >>> installed {cfg.label}  ({'replaced: the plist differed' if old else 'new'}; "
+            f"plist {path}, log {cfg.log_file})")
+    out.det(f"    > runs: {' '.join(args)}")
+    out.msg(f"    > agent: {agent_state(cfg.label)[1]}")
+    return 0
+
+
+def uninstall(cfg: Config, out: Out, go: bool) -> int:
+    PHASE[0] = "removing the LaunchAgent"
+    path = plist_path(cfg.label)
+    loaded, _state = agent_state(cfg.label)
+    there = os.path.exists(path)
+    if not loaded and not there:
+        out.msg(f" >>> not installed: no {cfg.label} loaded, no {path} -- nothing to remove")
+        return 0
+    what = " and ".join(([f"unload {cfg.label}"] if loaded else []) + ([f"remove {path}"] if there else []))
+    if not go:
+        out.msg(f" >>> would {what}")
+        out.msg(f"    > `{NAME} uninstall go` does it")
+        return 0
+    if loaded:
+        p = run(out, launchctl(), "bootout", f"gui/{os.getuid()}/{cfg.label}")
+        if p.returncode != 0:
+            err("00019", f"launchctl bootout failed [rc {p.returncode}]: {p.stderr.strip()}")
+    if there:
+        os.remove(path)   # written by `install` alone: nothing hand-made is lost
+    out.msg(f" >>> done: {what}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Version
+
+
+def build_id() -> str:
+    """First 12 hex of this file's own SHA-256: the bytes that run."""
+    import hashlib
+    try:
+        with open(os.path.realpath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+def _git(*a: str) -> subprocess.CompletedProcess[str]:
+    here = os.path.dirname(os.path.realpath(__file__))
+    return subprocess.run(["git", "-c", "safe.directory=*", "-C", here, *a],
+                          capture_output=True, text=True, timeout=5)
+
+
+def describe() -> str:
+    """git's describe in a checkout of THIS tool's repo, else the stamp."""
+    try:
+        r = _git("describe", "--tags", "--long")
+        if r.returncode == 0 and r.stdout.strip():
+            # describe answers about where the file SITS: a copy in a foreign
+            # repo gets that repo's tags -- the stamped commit proves the repo
+            if SCRIPT_COMMIT and _git("cat-file", "-e", f"{SCRIPT_COMMIT}^{{commit}}").returncode != 0:
+                return SCRIPT_RELEASE
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return SCRIPT_RELEASE if SCRIPT_COMMIT else ""
+
+
+def version_string() -> str:
+    build = build_id()
+    desc = describe()
+    head, _s, sha = desc.rpartition("-g")
+    tag, _s2, count = head.rpartition("-")
+    if sha and tag and count.isdigit():
+        n = int(count)
+        if n == 0:
+            return f"{NAME} {__version__} ({desc}: the {tag} tag, build {build})"
+        return f"{NAME} {__version__}+{n} ({desc}: {n} commit(s) past {tag}, unreleased, build {build})"
+    if SCRIPT_COMMIT:
+        return f"{NAME} {__version__} (commit {SCRIPT_COMMIT}, no release tag, build {build})"
+    return f"{NAME} {__version__} (build {build}, unstamped)"
+
+
+def stamp_version() -> int:
+    """Record HEAD and git's describe in this file, then AMEND that commit.
+    After committing, BEFORE pushing; tag afterwards. The stamped sha lags
+    HEAD by one: a commit cannot contain its own sha."""
+    import re
+    path = os.path.realpath(__file__)
+    rel = os.path.basename(path)
+    if _git("rev-parse", "--git-dir").returncode != 0:
+        err("00020", "not a git checkout -- nothing to stamp")
+    sha = _git("rev-parse", "--short", "HEAD").stdout.strip()
+    if not sha:
+        err("00021", "no commit to stamp from")
+    if (_git("rev-parse", "--abbrev-ref", "@{upstream}").returncode == 0
+            and _git("merge-base", "--is-ancestor", "HEAD", "@{upstream}").returncode == 0):
+        err("00022", "HEAD is already pushed -- amending it would rewrite published history; "
+                     "commit, stamp, THEN push")
+    if not _git("show", "--name-only", "--format=", "HEAD", "--", rel).stdout.strip():
+        err("00023", f"HEAD does not touch {rel} -- it is not this file's commit")
+    staged = _git("diff", "--cached", "--name-only").stdout.split()
+    if staged:
+        err("00024", f"something is staged -- the amend would fold it in: {' '.join(staged)}")
+    if _git("diff", "--quiet", "--", rel).returncode != 0:
+        err("00025", f"{rel} has uncommitted edits -- commit them first")
+    desc = _git("describe", "--tags", "--long").stdout.strip()
+    with open(path) as f:
+        src = f.read()
+    new, n1 = re.subn(r'^SCRIPT_COMMIT = .*$', f'SCRIPT_COMMIT = "{sha}"', src, count=1, flags=re.M)
+    new, n2 = re.subn(r'^SCRIPT_RELEASE = .*$', f'SCRIPT_RELEASE = "{desc}"', new, count=1, flags=re.M)
+    if n1 != 1 or n2 != 1:
+        err("00026", "the SCRIPT_COMMIT / SCRIPT_RELEASE lines are not where they should be")
+    if new == src:
+        sys.stdout.write(f" >>> already stamped with {sha}\n")
+        return 0
+    tmp = f"{path}.stamp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(new)
+    os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+    os.replace(tmp, path)
+    if _git("add", "--", rel).returncode != 0 or _git("commit", "--amend", "--no-edit", "--", rel).returncode != 0:
+        err("00027", "git add / commit --amend failed")
+    head = _git("rev-parse", "--short", "HEAD").stdout.strip()
+    sys.stdout.write(f" >>> stamped SCRIPT_COMMIT={sha} SCRIPT_RELEASE={desc or '<no tag yet>'} "
+                     f"-- HEAD is now {head} (lags by one: unavoidable)\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Command line
+
+
+def main(argv: Sequence[str]) -> int:
+    try:
+        return _main(list(argv))
+    except KeyboardInterrupt:
+        sys.stderr.write(f"\n{NAME}: interrupted (Ctrl-C) while {PHASE[0]} -- nothing after that ran; "
+                         f"the output keeps whatever was set before it\n")
+        return 130
+    except Exception:            # a bug of ours: its trace goes to a file, never to the screen
+        return internal_error()
+
+
+def internal_error() -> int:
+    import tempfile
+    import traceback
+    e = sys.exc_info()[1]
+    d = TRACE_DIR[0] or f"/var/log/mine/{os.environ.get('USER') or os.getuid()}"
+    if not os.access(d, os.W_OK):
+        d = tempfile.gettempdir()
+    path = os.path.join(d, f"{NAME}.trace.{time.strftime('%Y%m%dT%H%M%S')}.{os.getpid()}")
+    try:
+        with open(path, "w") as f:
+            f.write(f"{version_string()} while {PHASE[0]}\n")
+            traceback.print_exc(file=f)
+        where = f"the trace is in {path}"
+    except OSError:
+        where = "the trace could not be written"
+    sys.stderr.write(f"ERROR 00028 [70]: internal error while {PHASE[0]}: "
+                     f"{type(e).__name__}: {e} -- {where}\n")
+    return 70
+
+
+def _optarg(args: list[str], i: int, flag: str) -> tuple[str, int]:
+    """The value of `--flag=V` or `--flag V`; ('', i) when there is none."""
+    a = args[i]
+    if a.startswith(flag + "="):
+        return a[len(flag) + 1:], i
+    if i + 1 < len(args) and not args[i + 1].startswith("-"):
+        return args[i + 1], i + 1
+    return "", i
+
+
+def _main(args: list[str]) -> int:
+    out = Out()
+    config = ""
+    verb = ""
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if verb:
+            rest.append(a)
+        elif a in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            return 0
+        elif a == "--version":
+            sys.stdout.write(version_string() + "\n")
+            return 0
+        elif a == "--run-tests":
+            return run_tests(args[i + 1] if i + 1 < len(args) else "")
+        elif a == "--stamp-version":
+            return stamp_version()
+        elif a == "--create-config" or a.startswith("--create-config="):
+            target, i = _optarg(args, i, "--create-config")
+            return create_config(target)
+        elif a == "--config" or a.startswith("--config="):
+            config, i = _optarg(args, i, "--config")
+            if not config:
+                err("00029", "--config needs a FILE", 2)
+        elif a == "-Q":
+            out.quiet = True
+        elif a == "-V":
+            out.verbose = True
+        elif a == "-D":
+            out.debug = True
+            if i + 1 < len(args) and not args[i + 1].startswith("-") and args[i + 1] not in VERBS:
+                out.debug_path = args[i + 1]
+                i += 1
+        elif a.startswith("-"):
+            bare = a.lstrip("-")
+            if bare in VERBS:
+                err("00030", f"no such option '{a}'; you mean `{NAME} {bare}`", 2)
+            if bare == "status":
+                err("00031", f"no such option '{a}'; the status is what `{NAME}` shows without a verb", 2)
+            err("00032", f"unknown option '{a}' -- `{NAME} -h` lists them", 2)
+        else:
+            verb = a
+        i += 1
+    if out.debug:
+        out.verbose = True
+    if out.verbose:
+        out.quiet = False
+    if verb == "status":
+        err("00033", f"the status is what `{NAME}` shows without a verb", 2)
+    if verb and verb not in VERBS:
+        err("00034", f"unknown verb '{verb}' -- the verbs are: {', '.join(VERBS)}", 2)
+    if rest and not (verb == "uninstall" and rest == ["go"]):
+        err("00035", f"'{verb}' takes no argument, got '{' '.join(rest)}'"
+                     + (" (only `uninstall go`)" if verb == "uninstall" else ""), 2)
+    PHASE[0] = "reading the config"
+    path, explicit = find_config(config)
+    cfg = load_config(path, explicit)
+    out.dbg(f"config {path}: {len(cfg.rules)} rule(s), fallback {cfg.fallback!r}, "
+            f"recheck {cfg.recheck:g} s, settle {cfg.settle:g} s, label {cfg.label}")
+    if verb == "install":
+        return install(cfg, out)
+    if verb == "uninstall":
+        return uninstall(cfg, out, rest == ["go"])
+    PHASE[0] = "reading the audio devices"
+    a = audio()
+    try:
+        if verb == "apply":
+            PHASE[0] = "applying the rules"
+            return 0 if apply_rules(a, cfg, out, a.devices()) else 1
+        if verb == "watch":
+            return watch(a, cfg, out)
+        return status(a, cfg, out)
+    except AudioError as e:
+        err("00036", str(e))
+
+
+# --------------------------------------------------------------------------
+# Self-test: TAP -- the plan first, then one ok / not ok line per test
+
+
+class T:
+    """One test's checks, printed beside it; counts across the run."""
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+        self.passed = 0
+        self.failed = 0
+
+    def ok(self, cond: bool, what: str) -> None:
+        if cond:
+            self.passed += 1
+            sys.stdout.write(f"    ok    {what}\n")
+        else:
+            self.failed += 1
+            sys.stdout.write(f"    FAIL  {what}\n")
+
+    def path(self, name: str) -> str:
+        return os.path.join(self.root, name)
+
+    def fake(self, devices: list[dict[str, object]], default: int) -> str:
+        p = self.path("audio.json")
+        with open(p, "w") as f:
+            json.dump({"devices": devices, "default": default, "sets": 0}, f)
+        return p
+
+    def conf(self, rules: str, fallback: str = "", label: str = "test.my-audio") -> str:
+        p = self.path("my-audio.conf")
+        with open(p, "w") as f:
+            f.write(f"AUDIO_RULES='{rules}'\nOUTPUT_FALLBACK=\"{fallback}\"\nRECHECK_INTERVAL=60\n"
+                    f"SETTLE_TIME=0\nLAUNCHD_LABEL=\"{label}\"\nLOG_FILE=\"{self.root}/my-audio.log\"\n")
+        return p
+
+    def cfg(self, rules: str, fallback: str = "") -> Config:
+        return Config(path="test", explicit=True, rules=parse_rules(rules), fallback=fallback,
+                      recheck=60, settle=0, label="test.my-audio", log_file=self.path("log"))
+
+    def cli(self, *args: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+        e = {**os.environ, "HOME": self.root, "MY_AUDIO_CONFIG": self.path("my-audio.conf"),
+             "MY_AUDIO_FAKE": self.path("audio.json"), "MY_AUDIO_LAUNCHCTL": self.stub(), **(env or {})}
+        p = subprocess.run([sys.executable, os.path.realpath(__file__), *args], capture_output=True,
+                           text=True, env=e, stdin=subprocess.DEVNULL, timeout=60)
+        return p.returncode, p.stdout, p.stderr
+
+    def stub(self) -> str:
+        """A launchctl that logs its arguments and keeps 'loaded' in a file."""
+        p = self.path("launchctl")
+        if not os.path.exists(p):
+            with open(p, "w") as f:
+                f.write(f'#!/bin/sh\necho "$*" >> "{self.root}/launchctl.log"\n'
+                        f'L="{self.root}/loaded"\n'
+                        'case $1 in\n'
+                        '  print)     [ -e "$L" ] || exit 113; printf "\\tstate = running\\n\\tpid = 42\\n" ;;\n'
+                        '  bootstrap) : > "$L" ;;\n'
+                        '  bootout)   rm -f "$L" ;;\n'
+                        'esac\n')
+            os.chmod(p, 0o755)
+        return p
+
+    def default(self) -> int:
+        with open(self.path("audio.json")) as f:
+            v = json.load(f)["default"]
+        return int(v)
+
+    def sets(self) -> int:
+        with open(self.path("audio.json")) as f:
+            v = json.load(f)["sets"]
+        return int(v)
+
+
+def _dev(i: int, name: str, tran: str, outputs: int = 2) -> dict[str, object]:
+    return {"id": i, "uid": f"uid-{i}", "name": name, "tran": tran, "outputs": outputs,
+            "volume": 0.5, "mute": False}
+
+
+SPEAKERS = _dev(1, "Speakers", "bltn")
+MULTI = _dev(2, "Multi-Output Device", "grup", 0)      # 0 streams, as CoreAudio reports it
+HDMI = _dev(3, "Display", "hdmi")
+BT = _dev(4, "Speaker BT", "blue")
+BT_MIC = _dev(5, "Headset Mic", "blue", 0)
+RULES = "\nhdmi:* => @   # a display\nblue:* => Multi-Output Device\n"
+
+
+def t_rules_parse(t: T) -> None:
+    r = parse_rules("# comment\nhdmi:*  =>  @   # play through it\n\nBLUE:Speaker* => Multi-Output Device\n")
+    t.ok(len(r) == 2, f"two rules from two rule lines, a comment and a blank [{len(r)}]")
+    t.ok(r[0].target == "@" and r[0].text == "hdmi:* => @", f"'@' and the comment stripped [{r[0].text!r}]")
+    t.ok(r[1].transport == "blue" and r[1].glob == "Speaker*", "transport lowercased, glob kept")
+    t.ok(parse_rules("usb:Name#2 => @")[0].glob == "Name#2", "a '#' inside a name is not a comment")
+    for bad, why in (("hdmi:* @", "=>"), ("hmdi:* => @", "unknown transport"), ("hdmi => @", "glob"),
+                     ("hdmi:* =>", "no target")):
+        try:
+            parse_rules(f"usb:* => @\n{bad}")
+            t.ok(False, f"'{bad}' is refused")
+        except ValueError as e:
+            t.ok("line 2" in str(e) and why in str(e), f"'{bad}' refused, naming line 2: {e}")
+
+
+def t_first_rule_wins(t: T) -> None:
+    devs = [device_from_json(d) for d in (SPEAKERS, MULTI, HDMI, BT)]
+    d1 = decide(parse_rules(RULES), "", devs)
+    t.ok(d1.target == "Display" and d1.rule is not None and d1.rule.index == 1, f"hdmi first: the display [{d1.why()}]")
+    d2 = decide(parse_rules("blue:* => Multi-Output Device\nhdmi:* => @"), "", devs)
+    t.ok(d2.target == "Multi-Output Device", f"order swapped: the Multi-Output Device [{d2.why()}]")
+
+
+def t_at_needs_outputs(t: T) -> None:
+    mic = Device(5, "uid-5", "Headset Mic", "blue", 0)
+    d = decide(parse_rules("blue:* => @"), "", [mic])
+    t.ok(d.target is None, f"'@' never picks a device without outputs (a microphone) [{d.why()}]")
+    d2 = decide(parse_rules("blue:* => Multi-Output Device"), "", [mic])
+    t.ok(d2.target == "Multi-Output Device", "a named target still matches on that device")
+
+
+def t_fallback(t: T) -> None:
+    t.fake([SPEAKERS, MULTI], 2)
+    out = Out(quiet=True)
+    t.ok(apply_rules(FakeAudio(t.path("audio.json")), t.cfg(RULES), out,
+                     FakeAudio(t.path("audio.json")).devices()) and t.default() == 2,
+         "no rule matches, OUTPUT_FALLBACK empty: the output is left as is")
+    t.ok(apply_rules(FakeAudio(t.path("audio.json")), t.cfg(RULES, "Speakers"), out,
+                     FakeAudio(t.path("audio.json")).devices()) and t.default() == 1,
+         "no rule matches, OUTPUT_FALLBACK set: switched to it")
+
+
+def t_zero_stream_target(t: T) -> None:
+    t.fake([SPEAKERS, MULTI, BT], 1)
+    a = FakeAudio(t.path("audio.json"))
+    ok = apply_rules(a, t.cfg(RULES), Out(quiet=True), a.devices())
+    t.ok(ok and t.default() == 2, f"the Multi-Output Device (0 output streams) is accepted as target [default {t.default()}]")
+
+
+def t_manual_sticks(t: T) -> None:
+    t.fake([SPEAKERS, MULTI, BT], 1)
+    a = FakeAudio(t.path("audio.json"))
+    cfg = t.cfg(RULES)
+    out = Out(quiet=True)
+    prev = watch_step(a, cfg, out, None)
+    t.ok(t.default() == 2, "first look: the rules applied")
+    a.set_default_output(Device(1, "uid-1", "Speakers", "bltn", 2))          # the user, by hand
+    prev = watch_step(a, cfg, out, prev)
+    prev = watch_step(a, cfg, out, prev)
+    t.ok(t.default() == 1, "device set unchanged: the hand-chosen output stays, twice over")
+    t.fake([SPEAKERS, MULTI], 1)
+    prev = watch_step(a, cfg, out, prev)
+    t.fake([SPEAKERS, MULTI, BT], 1)
+    watch_step(a, cfg, out, prev)
+    t.ok(t.default() == 2, "unplugged and plugged again: the rules apply again")
+
+
+def t_missing_target(t: T) -> None:
+    t.fake([SPEAKERS, BT], 1)
+    a = FakeAudio(t.path("audio.json"))
+    try:
+        new = watch_step(a, t.cfg(RULES), Out(quiet=True), None)
+        t.ok(len(new) == 2 and t.default() == 1, "target not present: reported, output untouched, the loop goes on")
+    except BaseException as e:
+        t.ok(False, f"a missing target must not end the loop: {type(e).__name__}")
+    t.conf(RULES)
+    rc, so, se = t.cli("apply")
+    t.ok(rc == 1 and "ERROR 00014" in se and "not a present device" in se and so == "",
+         f"`apply` with the target missing: ERROR line, exit 1 [rc {rc}]")
+
+
+def t_already_default(t: T) -> None:
+    t.fake([SPEAKERS, MULTI, BT], 2)
+    a = FakeAudio(t.path("audio.json"))
+    apply_rules(a, t.cfg(RULES), Out(quiet=True), a.devices())
+    t.ok(t.sets() == 0, f"already the output: CoreAudio is not asked to set it again [sets {t.sets()}]")
+
+
+def t_config_search(t: T) -> None:
+    old = os.environ.get("LINKS")
+    os.environ["LINKS"] = t.root
+    try:
+        s = config_search_paths()
+        t.ok(s[:2] == [f"{t.root}/default/my-audio.conf", f"{t.root}/default/my-audio"],
+             "/LINKS/default first, .conf before the bare name, and $LINKS followed")
+        os.makedirs(f"{t.root}/global/etc/default")
+        offer = config_offer()
+        t.ok(len(offer) == 3 and "global/etc/default/my-audio.conf" in offer[0],
+             f"the offer: site first, written into global/, never into the default/ farm [{len(offer)}]")
+        t.ok(all("my-rollout" not in o or "global/" in o for o in offer), "only the site line needs my-rollout")
+    finally:
+        if old is None:
+            del os.environ["LINKS"]
+        else:
+            os.environ["LINKS"] = old
+    t.ok(f"/etc/{NAME}.conf" in config_search_paths() and os.path.expanduser(f"~/.{NAME}.conf")
+         in config_search_paths(), "every offered place is one the search reads")
+
+
+def t_config_load(t: T) -> None:
+    c = load_config(t.conf(RULES, "Speakers"), True)
+    t.ok(len(c.rules) == 2 and c.fallback == "Speakers" and c.label == "test.my-audio",
+         f"multi-line AUDIO_RULES survive the shell round trip [{len(c.rules)} rules]")
+    with open(t.path("my-audio.conf"), "a") as f:
+        f.write("unset LAUNCHD_LABEL\n")
+    t.fake([SPEAKERS], 1)
+    rc, _so, se = t.cli()
+    t.ok(rc == 1 and "ERROR 00006" in se and "LAUNCHD_LABEL" in se, f"a missing key is named [rc {rc}]")
+    rc, _so, se = t.cli(env={"MY_AUDIO_CONFIG": "", "LINKS": t.path("nolinks")})
+    t.ok(rc == 2 and "--create-config >" in se and "ERROR 00002" in se,
+         f"no config anywhere: the offer, exit 2 [rc {rc}]")
+
+
+def t_create_config(t: T) -> None:
+    rc, so, _se = t.cli("--create-config")
+    p = t.path("default.conf")
+    with open(p, "w") as f:
+        f.write(so)
+    c = load_config(p, True)
+    t.ok(rc == 0 and len(c.rules) == 3 and c.label == f"local.{NAME}", "the default config loads cleanly")
+    home = os.path.expanduser("~")
+    t.ok(home not in so and "/Users/" not in so and 'LAUNCHD_LABEL="local.' in so,
+         "the default config is neutral: no home path, the local. label")
+    rc2, _so, se = t.cli("--create-config", p)
+    with open(p) as f:
+        same = f.read() == so
+    t.ok(rc2 == 1 and "ERROR 00012" in se and same, f"--create-config FILE never overwrites [rc {rc2}]")
+    rc3, so3, _se = t.cli(f"--create-config={t.path('new.conf')}")
+    t.ok(rc3 == 0 and os.path.isfile(t.path("new.conf")) and "wrote" in so3, "--create-config=FILE writes a new one")
+
+
+def t_status(t: T) -> None:
+    t.fake([SPEAKERS, MULTI, BT], 2)
+    t.conf(RULES)
+    rc, so, _se = t.cli()
+    t.ok(rc == 0 and "output: Multi-Output Device  (rule 2: blue:* => Multi-Output Device -- 'Speaker BT' present)" in so,
+         "the status names the output and the rule that picked it, with the device")
+    t.ok("agent: not loaded" in so, "and the agent's state")
+    rc, sv, _se = t.cli("-V")
+    t.ok(rc == 0 and all(ln in sv.splitlines() for ln in so.splitlines()) and sv != so
+         and "uid uid-4" in sv, "-V adds the device list and keeps every default line")
+    t.fake([SPEAKERS, MULTI, BT], 1)
+    _rc, s2, _se = t.cli()
+    t.ok("chosen by hand" in s2 and "output: Speakers" in s2, "an output the rules did not pick is said so")
+
+
+def t_quiet(t: T) -> None:
+    t.fake([SPEAKERS, MULTI, BT], 1)
+    t.conf(RULES)
+    rc, so, _se = t.cli("-Q", "apply")
+    t.ok(rc == 0 and so == "" and t.default() == 2, "-Q apply: switched, nothing printed")
+    t.fake([SPEAKERS, BT], 1)
+    rc, so, se = t.cli("-Q", "apply")
+    t.ok(rc == 1 and so == "" and "ERROR 00014" in se, "-Q keeps the errors")
+
+
+def t_verbs(t: T) -> None:
+    t.fake([SPEAKERS], 1)
+    t.conf(RULES)
+    rc, _so, se = t.cli("--apply")
+    t.ok(rc == 2 and f"you mean `{NAME} apply`" in se, f"a dashed verb is answered [rc {rc}]")
+    rc, _so, se = t.cli("status")
+    t.ok(rc == 2 and "without a verb" in se, "`status` points at the bare command")
+    rc, _so, se = t.cli("apply", "now")
+    t.ok(rc == 2 and "takes no argument" in se, "a stray argument is refused")
+
+
+def t_install(t: T) -> None:
+    t.conf(RULES)
+    rc, so, se = t.cli("install")
+    plist = t.path("Library/LaunchAgents/test.my-audio.plist")
+    t.ok(rc == 0 and os.path.isfile(plist) and "installed test.my-audio" in so, f"install writes and loads [rc {rc}] {se.strip()}")
+    with open(plist, "rb") as f:
+        d = cast("dict[str, object]", plistlib.load(f))
+    args = cast("list[str]", d.get("ProgramArguments", []))
+    t.ok(args[:1] == [sys.executable] and args[-3:-1] == ["watch", "--config"]
+         and d.get("LimitLoadToSessionType") == "Aqua", "the plist runs `watch` with the Python of `install`")
+    rc, so, _se = t.cli("install")
+    t.ok(rc == 0 and "already installed" in so, "a second install changes nothing")
+
+
+def t_uninstall_guard(t: T) -> None:
+    t.conf(RULES)
+    t.cli("install")
+    plist = t.path("Library/LaunchAgents/test.my-audio.plist")
+    rc, so, _se = t.cli("uninstall")
+    t.ok(rc == 0 and os.path.isfile(plist) and os.path.exists(t.path("loaded")) and "would unload" in so,
+         "uninstall without go only says what it would do")
+    rc, so, _se = t.cli("uninstall", "go")
+    t.ok(rc == 0 and not os.path.exists(plist) and not os.path.exists(t.path("loaded")),
+         "uninstall go unloads and removes")
+    rc, so, _se = t.cli("uninstall", "go")
+    t.ok(rc == 0 and "nothing to remove" in so, "and a second one finds nothing")
+
+
+def t_sigint(t: T) -> None:
+    t.fake([SPEAKERS, MULTI], 1)
+    t.conf(RULES)
+    e = {**os.environ, "MY_AUDIO_CONFIG": t.path("my-audio.conf"), "MY_AUDIO_FAKE": t.path("audio.json")}
+    p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "watch"], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=e, text=True)
+    assert p.stdout is not None
+    first = p.stdout.readline()
+    p.send_signal(signal.SIGINT)
+    so, se = p.communicate(timeout=20)
+    t.ok("watching" in first, "watch is running")
+    t.ok(p.returncode == 130 and "interrupted (Ctrl-C)" in se and "Traceback" not in se + so
+         and len(se.strip().splitlines()) == 1, f"Ctrl-C: exit 130, one line, no traceback [rc {p.returncode}]")
+    p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "watch"], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=e, text=True)
+    assert p.stdout is not None
+    p.stdout.readline()
+    p.send_signal(signal.SIGTERM)
+    so, se = p.communicate(timeout=20)
+    t.ok(p.returncode == 0 and "stopped (SIGTERM)" in so, f"SIGTERM (launchd): a clean stop [rc {p.returncode}]")
+
+
+def t_internal_error(t: T) -> None:
+    with open(t.path("audio.json"), "w") as f:
+        json.dump({"devices": [{"id": 1}], "default": 1}, f)       # a device without its fields
+    t.conf(RULES)
+    rc, so, se = t.cli()
+    traces = [n for n in os.listdir(t.root) if n.startswith(f"{NAME}.trace.")]
+    t.ok(rc == 70 and "ERROR 00028" in se and "Traceback" not in se + so and len(traces) == 1,
+         f"a bug: one ERROR line, exit 70, the trace in a file beside the log [rc {rc}, {len(traces)} trace]")
+
+
+def t_version(t: T) -> None:
+    rc, so, _se = t.cli("--version")
+    t.ok(rc == 0 and so.startswith(f"{NAME} ") and f"build {build_id()}" in so, f"--version names the build [{so.strip()}]")
+    link = t.path("my-audio-link")
+    os.symlink(os.path.realpath(__file__), link)
+    p = subprocess.run([sys.executable, link, "--version"], capture_output=True, text=True)
+    t.ok(p.stdout == so, "run through a symlink: the same string")
+
+
+def t_coreaudio_reads(t: T) -> None:
+    if sys.platform != "darwin":
+        t.ok(True, "not macOS: skipped")
+        return
+    a = CoreAudio()
+    devs = a.devices()
+    d = a.default_output()
+    t.ok(len(devs) > 0 and any(x.id == d for x in devs) and all(x.uid for x in devs),
+         f"the real CoreAudio lists {len(devs)} device(s), the default among them (read-only)")
+
+
+def t_guard(t: T) -> None:
+    defined = sorted(n for n, v in globals().items() if n.startswith("t_") and callable(v))
+    listed = sorted(fn.__name__ for _title, fn in TESTS)
+    t.ok(defined == listed, f"every test function is in the run list [{len(defined)} defined, {len(listed)} listed]")
+
+
+TESTS: list[tuple[str, Callable[[T], None]]] = [
+    ("rules: parsed, comments stripped, bad lines named", t_rules_parse),
+    ("rules: the first rule with a present device wins", t_first_rule_wins),
+    ("rules: '@' never picks a device without outputs", t_at_needs_outputs),
+    ("rules: OUTPUT_FALLBACK empty leaves the output, set switches", t_fallback),
+    ("switch: a 0-stream Multi-Output Device is a valid target", t_zero_stream_target),
+    ("watch: a hand-chosen output stays until the devices change", t_manual_sticks),
+    ("watch: a missing target is reported and the loop goes on", t_missing_target),
+    ("switch: already the output -- not set again", t_already_default),
+    ("config: search order, and the offer reads only searched places", t_config_search),
+    ("config: loaded through the shell, a missing key named", t_config_load),
+    ("config: --create-config loads, is neutral, never overwrites", t_create_config),
+    ("status: the output, its rule, the agent; -V adds devices", t_status),
+    ("-Q: nothing on stdout, errors still on stderr", t_quiet),
+    ("verbs: dashed and unknown forms answered", t_verbs),
+    ("install: plist with the installing Python, idempotent", t_install),
+    ("uninstall: shows without go, does with go", t_uninstall_guard),
+    ("signals: Ctrl-C exits 130 in one line, SIGTERM stops cleanly", t_sigint),
+    ("errors: a bug is one line, exit 70, trace in a file", t_internal_error),
+    ("version: names the build, same through a symlink", t_version),
+    ("coreaudio: the real device list reads (read-only)", t_coreaudio_reads),
+    ("guard: every test function is listed", t_guard),
+]
+
+
+def run_tests(filt: str) -> int:
+    import shutil
+    import tempfile
+    sel = [(title, fn) for title, fn in TESTS if filt in title]
+    if not sel:
+        err("00037", f"--run-tests: no test title contains '{filt}'", 2)
+    sys.stdout.write(f"1..{len(sel)}\n")
+    root = os.path.realpath(tempfile.mkdtemp(prefix=f"{NAME}-tests."))
+    passed = failed = 0
+    try:
+        for k, (title, fn) in enumerate(sel, 1):
+            sys.stdout.write(f"== {title}\n")
+            d = os.path.join(root, str(k))
+            os.mkdir(d)
+            t = T(d)
+            try:
+                fn(t)
+            except Exception as e:     # a crashing check is a failure, not the end
+                t.ok(False, f"the check crashed: {type(e).__name__}: {e}")
+            passed += t.passed
+            failed += t.failed
+            sys.stdout.write(f"{'ok' if t.failed == 0 else 'not ok'} {k} - {title}\n")
+            sys.stdout.flush()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    v = sys.version_info
+    sys.stdout.write(f" >>> self-test (python {v.major}.{v.minor}.{v.micro}): {passed} passed, {failed} failed\n")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
