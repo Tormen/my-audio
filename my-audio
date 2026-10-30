@@ -25,12 +25,12 @@ from dataclasses import dataclass
 from typing import Callable, NoReturn, Sequence, cast
 
 # __version__ names the release these bytes are BASED on -- only a release
-# commit sets it; v0.0: no release of my-audio exists yet.  SCRIPT_COMMIT is
+# commit sets it.  SCRIPT_COMMIT is
 # the commit this file was released from and SCRIPT_RELEASE what `git describe
 # --tags --long` said then; both are written by `my-audio --stamp-version`, so
 # a copy without a .git beside it can still say what it is.
-__version__ = "v0.0"
-SCRIPT_COMMIT = "81eafb3"
+__version__ = "v0.1"
+SCRIPT_COMMIT = "b69b456"
 SCRIPT_RELEASE = ""
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
