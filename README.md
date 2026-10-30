@@ -86,6 +86,12 @@ the GUI session only (`LimitLoadToSessionType Aqua`), kept alive, output to
 `LOG_FILE` -- and runs it with the Python that ran `install`, so launchd's
 short `PATH` cannot pick another one.
 
+The plist carries one line after its DOCTYPE saying who installed it, when
+and how -- `<!-- installed by my-audio install (<user>) on <host>, <time>:
+generated, build <id> -->` -- so `my-rollout` counts the agent as my-audio's
+job, not as one nobody installed. `install` ignores that line when it
+compares, and writes again a plist that lacks it.
+
 ## Tests
 
 `my-audio --run-tests [FILTER]` -- TAP output. CoreAudio is replaced by a

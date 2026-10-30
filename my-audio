@@ -30,7 +30,7 @@ from typing import Callable, NoReturn, Sequence, cast
 # --tags --long` said then; both are written by `my-audio --stamp-version`, so
 # a copy without a .git beside it can still say what it is.
 __version__ = "v0.0"
-SCRIPT_COMMIT = "ab82cac"
+SCRIPT_COMMIT = "81eafb3"
 SCRIPT_RELEASE = ""
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
@@ -82,7 +82,9 @@ them).
                         RECHECK_INTERVAL seconds besides
   install               write the LaunchAgent (LAUNCHD_LABEL) for this user's
                         GUI session and load it; it runs `watch`, logging to
-                        LOG_FILE, with the Python that ran `install`
+                        LOG_FILE, with the Python that ran `install`. Its plist
+                        says so ("<!-- installed by my-audio install ...");
+                        one without that line is written again
   uninstall             what removing the LaunchAgent would do; `uninstall go`
                         unloads it and removes its plist
 
@@ -752,6 +754,28 @@ def run(out: Out, *cmd: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(list(cmd), capture_output=True, text=True)
 
 
+INSTALLED_BY = b"<!-- installed by "
+
+
+def with_installer(data: bytes) -> bytes:
+    """The plist with one line after its DOCTYPE saying who installed it,
+    when and how -- the line same_plist ignores."""
+    import socket
+    when = time.strftime("%Y-%m-%d %H:%M %z")
+    line = (f"<!-- installed by {NAME} install ({os.environ.get('USER') or os.getuid()}) on "
+            f"{socket.gethostname().split('.')[0]}, {when}: generated, build {build_id()} -->").encode()
+    head, sep, rest = data.partition(b"<plist ")
+    return head + line + b"\n" + sep + rest
+
+
+def same_plist(new: bytes, old: bytes) -> bool:
+    """The same job: equal but for the installer line, which the installed
+    one must have -- one without it is installed again."""
+    def body(b: bytes) -> list[bytes]:
+        return [ln for ln in b.splitlines() if not ln.startswith(INSTALLED_BY)]
+    return any(ln.startswith(INSTALLED_BY) for ln in old.splitlines()) and body(new) == body(old)
+
+
 def plist_path(label: str) -> str:
     return os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
 
@@ -764,7 +788,7 @@ def install(cfg: Config, out: Out) -> int:
                      f"{os.environ.get('USER', os.getuid())} -- create it, or set LOG_FILE")
     tool = os.path.abspath(sys.argv[0])
     args = [sys.executable, tool, "watch"] + (["--config", os.path.abspath(cfg.path)] if cfg.explicit else [])
-    data = plistlib.dumps({
+    data = with_installer(plistlib.dumps({
         "Label": cfg.label,
         "ProgramArguments": args,
         "RunAtLoad": True,
@@ -773,7 +797,7 @@ def install(cfg: Config, out: Out) -> int:
         "StandardOutPath": cfg.log_file,
         "StandardErrorPath": cfg.log_file,
         "ProcessType": "Background",
-    })
+    }))
     path = plist_path(cfg.label)
     try:
         with open(path, "rb") as f:
@@ -781,7 +805,7 @@ def install(cfg: Config, out: Out) -> int:
     except OSError:
         old = b""
     loaded, state = agent_state(cfg.label)
-    if old == data and loaded:
+    if same_plist(data, old) and loaded:
         out.msg(f" >>> already installed: {state}")
         out.det(f"    > plist {path} is the one `install` writes now")
         return 0
@@ -798,7 +822,9 @@ def install(cfg: Config, out: Out) -> int:
     p = run(out, launchctl(), "bootstrap", target, path)
     if p.returncode != 0:
         err("00018", f"launchctl bootstrap {target} {path} failed [rc {p.returncode}]: {p.stderr.strip()}")
-    out.msg(f" >>> installed {cfg.label}  ({'replaced: the plist differed' if old else 'new'}; "
+    why = ("new" if not old else "the plist differed" if not same_plist(data, old)
+           else "loaded again: the plist was right, the agent was not loaded")
+    out.msg(f" >>> installed {cfg.label}  ({why}; "
             f"plist {path}, log {cfg.log_file})")
     out.det(f"    > runs: {' '.join(args)}")
     out.msg(f"    > agent: {agent_state(cfg.label)[1]}")
@@ -1323,6 +1349,23 @@ def t_install(t: T) -> None:
          and d.get("LimitLoadToSessionType") == "Aqua", "the plist runs `watch` with the Python of `install`")
     rc, so, _se = t.cli("install")
     t.ok(rc == 0 and "already installed" in so, "a second install changes nothing")
+    with open(plist, "rb") as f:
+        lines = f.read().splitlines()
+    t.ok(lines[2].startswith(b"<!-- installed by my-audio install (") and b": generated, build " in lines[2],
+         f"the plist says who installed it, when and how: {lines[2][:70]!r}")
+    with open(plist, "wb") as f:
+        f.write(b"\n".join(ln if not ln.startswith(INSTALLED_BY) else
+                           ln.replace(b", 20", b", 1999-01-01 00:00 +0000, 20", 1) for ln in lines) + b"\n")
+    rc, so, _se = t.cli("install")
+    t.ok(rc == 0 and "already installed" in so, "installed earlier, same job: not installed again")
+    with open(plist, "wb") as f:
+        f.write(b"\n".join(ln for ln in lines if not ln.startswith(INSTALLED_BY)) + b"\n")
+    rc, so, _se = t.cli("install")
+    t.ok(rc == 0 and "the plist differed" in so, "installed without the installer line: installed again")
+    os.remove(t.path("loaded"))
+    rc, so, _se = t.cli("install")
+    t.ok(rc == 0 and "loaded again: the plist was right" in so and "differed" not in so,
+         f"the same plist, not loaded: says it was only loaded again -- {so.strip()[:90]}")
 
 
 def t_uninstall_guard(t: T) -> None:
