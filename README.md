@@ -69,11 +69,23 @@ it early.
 ## Config
 
 Found at `$MY_AUDIO_CONFIG`, `--config FILE`, else the first of
-`/LINKS/default/my-audio.conf`, `/LINKS/default/my-audio`,
+`<CONFIG_SEARCH_DIR>/my-audio.conf`, `<CONFIG_SEARCH_DIR>/my-audio`,
 `~/.my-audio.conf`, `/etc/my-audio.conf`, `/usr/local/etc/my-audio.conf`.
 Shell syntax, read with `.`. `my-audio --create-config` prints every key with
 its explanation: `AUDIO_RULES`, `OUTPUT_FALLBACK`, `RECHECK_INTERVAL`,
 `SETTLE_TIME`, `LAUNCHD_LABEL`, `LOG_FILE`.
+
+`/LINKS/default/site.conf`, when there, is read first -- plain `KEY="value"`
+lines, the site's values for every tool:
+
+| key | my-audio uses it as | without the file |
+|---|---|---|
+| `CONFIG_SEARCH_DIR` | searched for the config, ahead of `~` | not searched |
+| `CONFIG_OFFER_DIR`, `CONFIG_OFFER_NOTE` | offered when no config is found | not offered |
+| `LOG_BASE_DIR` | `LOG_FILE`'s default, `<base>/<user>/my-audio.log` | `/var/log` |
+
+There but unreadable is an error. A key the config sets wins: `LOG_FILE`
+written out keeps its value.
 
 ## Install
 

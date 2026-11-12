@@ -16,6 +16,8 @@ import fnmatch
 import json
 import os
 import plistlib
+import pwd
+import re
 import signal
 import subprocess
 import sys
@@ -30,8 +32,8 @@ from typing import Callable, NoReturn, Sequence, cast
 # --tags --long` said then; both are written by `my-audio --stamp-version`, so
 # a copy without a .git beside it can still say what it is.
 __version__ = "v0.1"
-SCRIPT_COMMIT = "b69b456"
-SCRIPT_RELEASE = ""
+SCRIPT_COMMIT = "c34528d"
+SCRIPT_RELEASE = "v0.1-1-gc34528d"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
@@ -48,6 +50,10 @@ PHASE = ["starting"]
 # Where an unexpected error's trace goes: the log's directory once the config
 # is read, else the per-user log directory, else the system temp directory.
 TRACE_DIR = [""]
+# The ONE site path in this tool, read by read_site. A test run points it at
+# its own folder ($MY_AUDIO_SITE_CONF, a test seam like $MY_AUDIO_FAKE).
+SITE_CONF_PATH = "/LINKS/default/site.conf"
+SITE_CONF = [os.environ.get("MY_AUDIO_SITE_CONF", "") or SITE_CONF_PATH]
 
 
 def err(code: str, msg: str = "Please fix.", exit_code: int = 1) -> NoReturn:
@@ -93,9 +99,9 @@ them).
                         and output streams, every command as it runs
   -D [PATH]             -V and the diagnostics (" ~~~ "), appended to PATH too
   --config FILE         use FILE; else $MY_AUDIO_CONFIG, else the first of
-                        /LINKS/default/{NAME}.conf, /LINKS/default/{NAME},
-                        ~/.{NAME}.conf, /etc/{NAME}.conf,
-                        /usr/local/etc/{NAME}.conf
+                        <CONFIG_SEARCH_DIR>/{NAME}.conf,
+                        <CONFIG_SEARCH_DIR>/{NAME}, ~/.{NAME}.conf,
+                        /etc/{NAME}.conf, /usr/local/etc/{NAME}.conf
   --create-config [FILE]
                         the default config, to stdout or to a new FILE (an
                         existing one is never overwritten)
@@ -105,6 +111,12 @@ them).
   --run-tests [FILTER]  the self-test; FILTER is a substring of a test title
   --stamp-version       record HEAD in this file and amend that commit --
                         after committing, before pushing
+
+{SITE_CONF_PATH}, when there, is read before the config: its
+CONFIG_SEARCH_DIR is searched first (none without the file), its
+CONFIG_OFFER_DIR offered when there is no config, and LOG_FILE's default lies
+under its LOG_BASE_DIR (/var/log without the file). There but unreadable: an
+error.
 """
 
 
@@ -113,8 +125,10 @@ def default_config() -> str:
     return f"""\
 # {NAME} -- configuration (shell syntax, read with '.')
 # Found at: $MY_AUDIO_CONFIG, --config FILE, else the first of
-# /LINKS/default/{NAME}.conf, /LINKS/default/{NAME}, ~/.{NAME}.conf,
-# /etc/{NAME}.conf, /usr/local/etc/{NAME}.conf.
+# <CONFIG_SEARCH_DIR>/{NAME}.conf, <CONFIG_SEARCH_DIR>/{NAME},
+# ~/.{NAME}.conf, /etc/{NAME}.conf, /usr/local/etc/{NAME}.conf --
+# CONFIG_SEARCH_DIR is the site's, from {SITE_CONF_PATH}
+# (none without it).
 
 # AUDIO_RULES -- one rule per line, read top to bottom. Each time the set of
 # audio devices changes, the FIRST rule whose device is present picks the
@@ -147,10 +161,11 @@ SETTLE_TIME=1
 # The LaunchAgent's label, for `{NAME} install` (e.g. com.example.{NAME}_watch).
 LAUNCHD_LABEL="local.{NAME}"
 
-# Where the LaunchAgent's output goes. The default keeps one directory per
-# user under /var/log/mine; outside such a setup, ~/Library/Logs/{NAME}.log
-# is the usual place.
-LOG_FILE="/var/log/mine/$(id -un)/{NAME}.log"
+# Where the LaunchAgent's output goes: one directory per user under the
+# site's LOG_BASE_DIR (from {SITE_CONF_PATH}; /var/log
+# without it); USER is the user {NAME} runs as. Where no such directory
+# exists, ~/Library/Logs/{NAME}.log is the usual place.
+LOG_FILE="$LOG_BASE_DIR/$USER/{NAME}.log"
 """
 
 
@@ -507,59 +522,112 @@ class Config:
     log_file: str
 
 
-def links_root() -> str:
-    return os.environ.get("LINKS") or "/LINKS"
+@dataclass(frozen=True)
+class Site:
+    """The site's values for every tool, from the site file; without it the
+    neutral ones: /var/log, no search directory, no offer."""
+    log_base_dir: str = "/var/log"
+    config_search_dir: str = ""
+    config_offer_dir: str = ""
+    config_offer_note: str = ""
 
 
-def config_search_paths() -> list[str]:
+# KEY="value", KEY='value' or KEY=value, then at most a # comment: no $, no `
+_SITE_LINE = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*)'|([^\s"'$`#]*))\s*(?:#.*)?""")
+
+
+def user() -> str:
+    """The user this runs as -- under sudo, root, as for every file it writes."""
+    return pwd.getpwuid(os.geteuid()).pw_name
+
+
+def read_site() -> Site:
+    """The site file, read before the config: plain KEY="value" lines, parsed
+    and never run. Not there: the neutral values. There but unreadable: an
+    error -- the neutral values would put this user's log apart from everyone
+    else's. Never the environment: a LaunchAgent, sudo and a login shell would
+    each see different values."""
+    path = SITE_CONF[0]
+    if not os.path.lexists(path):
+        return Site()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        err("00038", f"cannot read {path} ({e.strerror}) -- the site's directories for every tool")
+    vals: dict[str, str] = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = _SITE_LINE.fullmatch(s)
+        if m is None:
+            err("00039", f"{path} line {n} is not a plain KEY=\"value\" line (no $, no `: every tool "
+                         f"reads the file the same): {s}")
+        vals[m.group(1)] = m.group(2) or m.group(3) or m.group(4) or ""
+    return Site(log_base_dir=vals.get("LOG_BASE_DIR") or Site.log_base_dir,
+                config_search_dir=vals.get("CONFIG_SEARCH_DIR", ""),
+                config_offer_dir=vals.get("CONFIG_OFFER_DIR", ""),
+                config_offer_note=vals.get("CONFIG_OFFER_NOTE", ""))
+
+
+def config_search_paths(site: Site) -> list[str]:
     """Where the config is looked for, in order -- the one list the search
-    and the offer both use."""
-    d = f"{links_root()}/default"
-    return [f"{d}/{NAME}.conf", f"{d}/{NAME}", os.path.expanduser(f"~/.{NAME}.conf"),
-            f"/etc/{NAME}.conf", f"/usr/local/etc/{NAME}.conf"]
+    and the offer both use: the site's search directory (both names), ~, /etc."""
+    d = site.config_search_dir
+    return ([f"{d}/{NAME}.conf", f"{d}/{NAME}"] if d else []) + [
+        os.path.expanduser(f"~/.{NAME}.conf"), f"/etc/{NAME}.conf", f"/usr/local/etc/{NAME}.conf"]
 
 
-def config_offer() -> list[str]:
-    """Paste-ready lines to create a config, most common place first; each
-    one checked to be READ by the search, so the offer cannot drift."""
-    search = config_search_paths()
-    site = f"{links_root()}/global/etc/default"
-    cand: list[tuple[str, str, str]] = []     # (write here, read there, note)
-    if os.path.isdir(site):
-        cand.append((f"{site}/{NAME}.conf", f"{links_root()}/default/{NAME}.conf",
-                     "as root; then `my-rollout go` links it"))
-    cand.append((f"/etc/{NAME}.conf", f"/etc/{NAME}.conf", "as root"))
-    home = os.path.expanduser(f"~/.{NAME}.conf")
-    cand.append((home, home, ""))
-    return [f"        > {NAME} --create-config > {w}" + (f"   ({note})" if note else "")
-            for w, r, note in cand if r in search]
+def config_offer(site: Site) -> list[tuple[str, str]]:
+    """Where to write a config, most common place first, each with its note:
+    the site's offer directory -- only while the site's search directory is
+    searched, which a file there reaches as the note says, and never that
+    search directory itself, a farm -- then /etc and ~, each only when searched."""
+    offer: list[tuple[str, str]] = []
+    if site.config_offer_dir and site.config_search_dir and site.config_offer_dir != site.config_search_dir:
+        offer.append((f"{site.config_offer_dir}/{NAME}.conf", site.config_offer_note))
+    searched = config_search_paths(site)
+    return offer + [(p, note) for p, note in ((f"/etc/{NAME}.conf", "as root"),
+                                              (os.path.expanduser(f"~/.{NAME}.conf"), ""))
+                    if p in searched]
 
 
-def find_config(explicit: str) -> tuple[str, bool]:
+def no_config_offer(site: Site) -> str:
+    """'no config found': each offered place a paste-ready line, its note beside it."""
+    return (f"!!! {NAME} needs a config: the rules are yours to write.\n"
+            f"--> no config found -- write one, most common place first "
+            f"(`{NAME} -h` has the search order):\n"
+            + "".join(f"        > {NAME} --create-config > {p}" + (f"   ({note})" if note else "") + "\n"
+                      for p, note in config_offer(site)))
+
+
+def find_config(explicit: str, site: Site) -> tuple[str, bool]:
     if explicit:
         return explicit, True
     env = os.environ.get("MY_AUDIO_CONFIG", "")
     if env:
         return env, True
-    for p in config_search_paths():
+    for p in config_search_paths(site):
         if os.path.isfile(p):
             return p, False
-    sys.stderr.write(f"!!! {NAME} needs a config: the rules are yours to write.\n"
-                     f"--> no config found -- write one, most common place first "
-                     f"(`{NAME} -h` has the search order):\n" + "\n".join(config_offer()) + "\n")
+    sys.stderr.write(no_config_offer(site))
     err("00002", "no config found", 2)
 
 
-def load_config(path: str, explicit: bool) -> Config:
-    """Source the config with a POSIX shell and read the keys back."""
+def load_config(path: str, explicit: bool, site: Site) -> Config:
+    """Source the config with a POSIX shell and read the keys back. The shell
+    has the site's LOG_BASE_DIR and USER (the user this runs as) set first, so
+    an exported variable never takes their place."""
     if not os.path.isfile(path):
         err("00003", f"config '{path}' does not exist")
     if not os.access(path, os.R_OK):
         err("00004", f"config '{path}' is not readable")
     sh = "/bin/dash" if os.path.exists("/bin/dash") else "/bin/sh"
-    script = ('. "$1" >/dev/null || exit 3; shift; '
+    script = ('LOG_BASE_DIR=$2 USER=$3; . "$1" >/dev/null || exit 3; shift 3; '
               'for k; do eval "s=\\${$k+1} v=\\${$k-}"; printf "%s\\0%s\\0" "${s:-0}" "$v"; done')
-    p = subprocess.run([sh, "-c", script, NAME, path, *CONFIG_KEYS], capture_output=True, text=True)
+    p = subprocess.run([sh, "-c", script, NAME, path, site.log_base_dir, user(), *CONFIG_KEYS],
+                       capture_output=True, text=True)
     if p.returncode != 0:
         err("00005", f"config '{path}' does not source cleanly [rc {p.returncode}]: "
                      f"{p.stderr.strip() or 'no message'}")
@@ -969,8 +1037,8 @@ def internal_error() -> int:
     import tempfile
     import traceback
     e = sys.exc_info()[1]
-    d = TRACE_DIR[0] or f"/var/log/mine/{os.environ.get('USER') or os.getuid()}"
-    if not os.access(d, os.W_OK):
+    d = TRACE_DIR[0]
+    if not d or not os.access(d, os.W_OK):
         d = tempfile.gettempdir()
     path = os.path.join(d, f"{NAME}.trace.{time.strftime('%Y%m%dT%H%M%S')}.{os.getpid()}")
     try:
@@ -1053,8 +1121,10 @@ def _main(args: list[str]) -> int:
         err("00035", f"'{verb}' takes no argument, got '{' '.join(rest)}'"
                      + (" (only `uninstall go`)" if verb == "uninstall" else ""), 2)
     PHASE[0] = "reading the config"
-    path, explicit = find_config(config)
-    cfg = load_config(path, explicit)
+    site = read_site()
+    TRACE_DIR[0] = f"{site.log_base_dir}/{user()}"
+    path, explicit = find_config(config, site)
+    cfg = load_config(path, explicit, site)
     out.dbg(f"config {path}: {len(cfg.rules)} rule(s), fallback {cfg.fallback!r}, "
             f"recheck {cfg.recheck:g} s, settle {cfg.settle:g} s, label {cfg.label}")
     if verb == "install":
@@ -1116,7 +1186,8 @@ class T:
 
     def cli(self, *args: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
         e = {**os.environ, "HOME": self.root, "MY_AUDIO_CONFIG": self.path("my-audio.conf"),
-             "MY_AUDIO_FAKE": self.path("audio.json"), "MY_AUDIO_LAUNCHCTL": self.stub(), **(env or {})}
+             "MY_AUDIO_FAKE": self.path("audio.json"), "MY_AUDIO_LAUNCHCTL": self.stub(),
+             "MY_AUDIO_SITE_CONF": self.path("site.conf"), **(env or {})}
         p = subprocess.run([sys.executable, os.path.realpath(__file__), *args], capture_output=True,
                            text=True, env=e, stdin=subprocess.DEVNULL, timeout=60)
         return p.returncode, p.stdout, p.stderr
@@ -1248,29 +1319,86 @@ def t_already_default(t: T) -> None:
     t.ok(t.sets() == 0, f"already the output: CoreAudio is not asked to set it again [sets {t.sets()}]")
 
 
-def t_config_search(t: T) -> None:
-    old = os.environ.get("LINKS")
-    os.environ["LINKS"] = t.root
+def t_site_conf_gives_the_bases_the_search_and_the_offer(t: T) -> None:
+    """The site file's values when it is there, the neutral ones when it is
+    not -- an exported variable never in their place -- an error when it is
+    there but unreadable or holds a $; the search reads its directory first,
+    the bare name too; LOG_FILE's default lies under its LOG_BASE_DIR and the
+    user it runs as; the offer names its offer directory with the note."""
+    me, farm, site_file = user(), t.path("farm"), t.path("site.conf")
+    default = t.path("default.conf")
+    with open(default, "w") as f:
+        f.write(default_config())
+    old = {k: os.environ.get(k) for k in ("LOG_BASE_DIR", "USER")}
+    os.environ.update(LOG_BASE_DIR="/elsewhere", USER="someone-else")
     try:
-        s = config_search_paths()
-        t.ok(s[:2] == [f"{t.root}/default/my-audio.conf", f"{t.root}/default/my-audio"],
-             "/LINKS/default first, .conf before the bare name, and $LINKS followed")
-        os.makedirs(f"{t.root}/global/etc/default")
-        offer = config_offer()
-        t.ok(len(offer) == 3 and "global/etc/default/my-audio.conf" in offer[0],
-             f"the offer: site first, written into global/, never into the default/ farm [{len(offer)}]")
-        t.ok(all("my-rollout" not in o or "global/" in o for o in offer), "only the site line needs my-rollout")
+        t.ok(read_site() == Site(), f"without the file: the neutral values [{read_site()}]")
+        log = load_config(default, True, read_site()).log_file
+        t.ok(log == f"/var/log/{me}/{NAME}.log", f"without the file, LOG_FILE's default: {log}")
+        os.mkdir(farm)
+        with open(site_file, "w") as f:
+            f.write(f'# the site\nDATA_BASE_DIR="/srv/data"\nLOG_BASE_DIR="/srv/log"   # logs\n'
+                    f'CONFIG_SEARCH_DIR="{farm}"\nCONFIG_OFFER_DIR="{t.root}/global"\n'
+                    f'CONFIG_OFFER_NOTE="linked there by a run"\n')
+        site = read_site()
+        t.ok(site == Site("/srv/log", farm, f"{t.root}/global", "linked there by a run"), f"with the file: {site}")
+        log = load_config(default, True, site).log_file
+        t.ok(log == f"/srv/log/{me}/{NAME}.log", f"with the file, LOG_FILE's default: {log}")
+        with open(f"{farm}/{NAME}", "w") as f:
+            f.write(default_config())
+        try:
+            found: tuple[str, bool] | None = find_config("", site)
+        except SystemExit:        # not found: its error, and a failed check, not the end of the run
+            found = None
+        t.ok(found == (f"{farm}/{NAME}", False), f"the search directory's bare name is found: {found}")
     finally:
-        if old is None:
-            del os.environ["LINKS"]
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    os.remove(f"{farm}/{NAME}")
+    rc, _so, se = t.cli(env={"MY_AUDIO_CONFIG": ""})
+    t.ok(rc == 2 and f"> {NAME} --create-config > {t.root}/global/{NAME}.conf   (linked there by a run)\n" in se
+         and f"--create-config > {farm}/" not in se, f"no config: the offer directory with its note, never "
+                                                     f"the farm [rc {rc}]")
+    for text, code in (('LOG_BASE_DIR="$HOME/x"\n', "00039"), ('LOG_BASE_DIR="/x"\n', "00038"),
+                       (None, "00038")):
+        os.remove(site_file)
+        if text is None:
+            os.symlink(t.path("gone"), site_file)
         else:
-            os.environ["LINKS"] = old
-    t.ok(f"/etc/{NAME}.conf" in config_search_paths() and os.path.expanduser(f"~/.{NAME}.conf")
-         in config_search_paths(), "every offered place is one the search reads")
+            with open(site_file, "w") as f:
+                f.write(text)
+            if code == "00038":
+                os.chmod(site_file, 0)
+        rc, so, se = t.cli()
+        t.ok(rc == 1 and f"ERROR {code}" in se and site_file in se and so == "",
+             f"{'a dangling link' if text is None else repr(text.strip())}: ERROR {code} [rc {rc}]")
+        if text is not None:
+            os.chmod(site_file, 0o600)
+
+
+def t_config_offer_names_only_searched_paths(t: T) -> None:
+    """Every offered path is searched, or is the site's offer directory while
+    the site's search directory is searched; that search directory, a farm,
+    is never offered -- not even when the offer directory is the same one."""
+    farm, glob = t.path("farm"), t.path("global")
+    for site in (Site("/var/log", farm, glob, "n"), Site("/var/log", farm, farm, "n"),
+                 Site("/var/log", "", glob, "n"), Site()):
+        offer = [p for p, _note in config_offer(site)]
+        search = config_search_paths(site)
+        site_line = f"{glob}/{NAME}.conf"
+        stray = [p for p in offer if p not in search and not (p == site_line and site.config_search_dir)]
+        t.ok(not stray and not any(p.startswith(farm + "/") for p in offer)
+             and offer[-2:] == [f"/etc/{NAME}.conf", os.path.expanduser(f"~/.{NAME}.conf")],
+             f"search {site.config_search_dir or '-'}, offer {site.config_offer_dir or '-'}: {offer}")
+    s = config_search_paths(Site("/var/log", farm))
+    t.ok(s[:2] == [f"{farm}/{NAME}.conf", f"{farm}/{NAME}"], "the search directory first, .conf before the bare name")
 
 
 def t_config_load(t: T) -> None:
-    c = load_config(t.conf(RULES, "Speakers"), True)
+    c = load_config(t.conf(RULES, "Speakers"), True, Site())
     t.ok(len(c.rules) == 2 and c.fallback == "Speakers" and c.label == "test.my-audio",
          f"multi-line AUDIO_RULES survive the shell round trip [{len(c.rules)} rules]")
     with open(t.path("my-audio.conf"), "a") as f:
@@ -1278,7 +1406,7 @@ def t_config_load(t: T) -> None:
     t.fake([SPEAKERS], 1)
     rc, _so, se = t.cli()
     t.ok(rc == 1 and "ERROR 00006" in se and "LAUNCHD_LABEL" in se, f"a missing key is named [rc {rc}]")
-    rc, _so, se = t.cli(env={"MY_AUDIO_CONFIG": "", "LINKS": t.path("nolinks")})
+    rc, _so, se = t.cli(env={"MY_AUDIO_CONFIG": ""})
     t.ok(rc == 2 and "--create-config >" in se and "ERROR 00002" in se,
          f"no config anywhere: the offer, exit 2 [rc {rc}]")
 
@@ -1288,7 +1416,7 @@ def t_create_config(t: T) -> None:
     p = t.path("default.conf")
     with open(p, "w") as f:
         f.write(so)
-    c = load_config(p, True)
+    c = load_config(p, True, Site())
     t.ok(rc == 0 and len(c.rules) == 3 and c.label == f"local.{NAME}", "the default config loads cleanly")
     home = os.path.expanduser("~")
     t.ok(home not in so and "/Users/" not in so and 'LAUNCHD_LABEL="local.' in so,
@@ -1449,7 +1577,9 @@ TESTS: list[tuple[str, Callable[[T], None]]] = [
     ("watch: a hand-chosen output stays until the devices change", t_manual_sticks),
     ("watch: a missing target is reported and the loop goes on", t_missing_target),
     ("switch: already the output -- not set again", t_already_default),
-    ("config: search order, and the offer reads only searched places", t_config_search),
+    ("site.conf: the bases, the search and the offer; unreadable is an error",
+     t_site_conf_gives_the_bases_the_search_and_the_offer),
+    ("config: the offer names only searched places, never the farm", t_config_offer_names_only_searched_paths),
     ("config: loaded through the shell, a missing key named", t_config_load),
     ("config: --create-config loads, is neutral, never overwrites", t_create_config),
     ("status: the output, its rule, the agent; -V adds devices", t_status),
@@ -1480,6 +1610,7 @@ def run_tests(filt: str) -> int:
             d = os.path.join(root, str(k))
             os.mkdir(d)
             t = T(d)
+            SITE_CONF[0] = t.path("site.conf")       # the test's own: none until a test writes it
             try:
                 fn(t)
             except Exception as e:     # a crashing check is a failure, not the end
